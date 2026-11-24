@@ -1,0 +1,155 @@
+# Dark Factory: verified by your CI.
+#
+# Runs the factory's checks for your stack, in YOUR CI (your packages, your services), then proves
+# the result to the factory with GitHub's OIDC identity token. The factory accepts a report only
+# when GitHub's token says it came from THIS workflow, at a pinned version, on a repository
+# registered to report.
+#
+# ⚠ The inputs choose the stack, never the commands. If a caller could pass commands, "tests" could
+# be `true`. Changing what runs means a new version of this workflow, pinned by the factory.
+#
+# Use it from your repository (see README.md):
+#   jobs:
+#     verify:
+#       uses: relw-ai/factory-actions/.github/workflows/verify.yml@v1
+#       permissions: { id-token: write, contents: read }
+#       with: { stack: typescript }
+
+name: factory-verify
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: "python | typescript"
+        type: string
+        required: true
+      python-version:
+        type: string
+        default: "3.11"
+      node-version:
+        type: string
+        default: "22"
+      factory-url:
+        description: "Where to report. The token is addressed to df.relw.ai, so it is useless anywhere else."
+        type: string
+        default: "https://df.relw.ai/ci/report"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse an unknown stack
+        if: inputs.stack != 'python' && inputs.stack != 'typescript'
+        run: echo "stack must be python or typescript" && exit 2
+
+      # ---- python -------------------------------------------------------------
+      - if: inputs.stack == 'python'
+        uses: actions/setup-python@v5
+        with: { python-version: "${{ inputs.python-version }}" }
+      - name: Install (python, from your lockfile)
+        if: inputs.stack == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f uv.lock ]; then pip install uv && uv sync --frozen --all-extras && echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          elif [ -f requirements.txt ]; then pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install -e .
+          fi
+          python -m pip install "pytest==8.4.2" "ruff==0.16.7"
+
+      # ---- typescript ---------------------------------------------------------
+      - if: inputs.stack == 'typescript' && (hashFiles('bun.lock') != '' || hashFiles('bun.lockb') != '')
+        uses: oven-sh/setup-bun@v2
+      - if: inputs.stack == 'typescript'
+        uses: actions/setup-node@v4
+        with: { node-version: "${{ inputs.node-version }}" }
+      - name: Install (typescript, from your lockfile, scripts off)
+        if: inputs.stack == 'typescript'
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile --ignore-scripts
+          elif [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile --ignore-scripts
+          elif [ -f package-lock.json ]; then npm ci --ignore-scripts
+          else echo "no lockfile: the factory verifies locked installs only" && exit 2
+          fi
+
+      # ---- the checks: fixed per stack, recorded, never allowed to stop the report --
+      - name: Run the factory's checks
+        id: checks
+        shell: bash
+        env:
+          STACK: ${{ inputs.stack }}     # via env, never interpolated into the script
+        run: |
+          set +e
+          mkdir -p .factory
+          run() {  # name kind command...
+            local name=$1 kind=$2; shift 2
+            "$@" > ".factory/$name.log" 2>&1; local code=$?
+            printf '%s\t%s\t%s\n' "$name" "$kind" "$code" >> .factory/stages.tsv
+            echo "::group::$name (exit $code)"; tail -n 60 ".factory/$name.log"; echo "::endgroup::"
+          }
+          if [ "$STACK" = python ]; then
+            run lint lint ruff check .
+            run tests test pytest -q
+          else
+            run typecheck lint npx tsc --noEmit
+            run lint lint npx eslint .
+            run tests test npx vitest run
+          fi
+          true
+
+      - name: Write the report
+        shell: bash
+        env:
+          STACK: ${{ inputs.stack }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          files = [f for f in subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0") if f]
+          stages = []
+          for line in open(".factory/stages.tsv"):
+              name, kind, code = line.rstrip("\n").split("\t")
+              # Only the LAST line leaves your CI (e.g. "3 passed, 1 failed"): full logs can carry
+              # your data or secrets, and the factory has no business holding them.
+              lines = [ln.strip() for ln in open(f".factory/{name}.log", errors="replace") if ln.strip()]
+              stages.append({"name": name, "kind": kind, "required": True,
+                             "exit_code": int(code), "summary": (lines[-1] if lines else "")[:200]})
+          def version(cmd):
+              try:
+                  return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()[:64]
+              except Exception:
+                  return "unavailable"
+          report = {
+              "schema": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "commit": os.environ["GITHUB_SHA"],
+              "stack": os.environ["STACK"],
+              "files": {f: hashlib.sha256(open(f, "rb").read()).hexdigest() for f in files if os.path.isfile(f)},
+              "stages": stages,
+              "tools": {"python": version(["python", "--version"]), "node": version(["node", "--version"])},
+          }
+          json.dump(report, open(".factory/report.json", "w"))
+          print(json.dumps({"stages": [(s["name"], s["exit_code"]) for s in stages]}))
+          PY
+
+      - name: Report to the factory, proved by GitHub
+        shell: bash
+        env:
+          FACTORY_URL: ${{ inputs.factory-url }}
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=df.relw.ai" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          curl -sS --fail-with-body -X POST "$FACTORY_URL" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            --data-binary @.factory/report.json
+          echo
+
+      - name: Fail the job if a check failed
+        shell: bash
+        run: |
+          awk -F'\t' '$3 != 0 { bad=1; print "failed: " $1 " (exit " $3 ")" } END { exit bad }' .factory/stages.tsv
